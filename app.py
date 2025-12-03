@@ -1,12 +1,10 @@
-# app.py
 import time
 import io
 import os
 import json
-import asyncio
 import threading
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -14,14 +12,13 @@ import requests
 from sklearn.preprocessing import MinMaxScaler
 import streamlit as st
 
-# Try to import python-binance async client; fallback if not available
+# Optional packages
 try:
     from binance import AsyncClient, BinanceSocketManager
     BINANCE_AVAILABLE = True
 except Exception:
     BINANCE_AVAILABLE = False
 
-# pandas_ta for indicators
 try:
     import pandas_ta as ta
     PANDAS_TA_AVAILABLE = True
@@ -40,13 +37,14 @@ except Exception:
 st.set_page_config(page_title="Crypto + Technical Dashboard + Forecast", layout="wide")
 
 # ---------------------------
-# MODEL LOADING (legacy-safe)
+# Constants / Defaults
 # ---------------------------
-# Put your model file in same directory, note previous uploads had file named like:
-# "Bitcoin_Price_prediction_Model (1).keras"
 DEFAULT_MODEL_FILENAME = "Bitcoin_Price_prediction_Model (1).keras"
 MODEL_PATH = st.sidebar.text_input("Model filename (uploaded)", value=DEFAULT_MODEL_FILENAME)
 
+# ---------------------------
+# Model loading (safe)
+# ---------------------------
 model = None
 model_load_error = None
 if KERAS_LEGACY and os.path.exists(MODEL_PATH):
@@ -61,9 +59,9 @@ else:
         model_load_error = f"Model file {MODEL_PATH} not found."
 
 # ---------------------------
-# GLOBALS & SHARED STATE
+# Shared state
 # ---------------------------
-LIVE_PRICES = {}            # e.g. {"BTCUSDT": 60000.12}
+LIVE_PRICES = {}
 LIVE_LOCK = threading.Lock()
 ASYNC_LOOP = None
 ASYNC_TASK = None
@@ -71,10 +69,11 @@ ASYNC_RUNNING = False
 LAST_RETRAIN_TS = None
 
 # ---------------------------
-# Helper: fetch data (yfinance)
+# Helpers
 # ---------------------------
 @st.cache_data(ttl=60)
 def fetch_yf(ticker: str, period: str = "1y", interval: str = "1d"):
+    """Fetch historical data from yfinance and return a flattened DataFrame with Date column."""
     df = yf.download(ticker, period=period, interval=interval, progress=False)
     # Flatten columns if MultiIndex
     df.columns = [c if not isinstance(c, tuple) else c[0] for c in df.columns]
@@ -82,34 +81,78 @@ def fetch_yf(ticker: str, period: str = "1y", interval: str = "1d"):
     return df
 
 # ---------------------------
-# Indicator calculations
+# Technical indicators (robust)
 # ---------------------------
 def add_technical_indicators(df: pd.DataFrame):
+    """Return a copy of df with technical indicator columns added. Safe to run across pandas_ta versions."""
     out = df.copy()
     if not PANDAS_TA_AVAILABLE:
+        # Provide empty columns to avoid downstream KeyErrors
+        for col in ["SMA_20","SMA_50","EMA_20","RSI","MACD","MACD_SIGNAL","BBL","BBM","BBU"]:
+            out[col] = pd.NA
         return out
+
+    # Ensure Close exists
+    if 'Close' not in out.columns:
+        raise ValueError("DataFrame must contain 'Close' column")
+
     close = out['Close']
-    # Simple moving averages
-    out['SMA_20'] = ta.sma(close, length=20)
-    out['SMA_50'] = ta.sma(close, length=50)
-    out['EMA_20'] = ta.ema(close, length=20)
+
+    # Moving averages
+    try:
+        out['SMA_20'] = ta.sma(close, length=20)
+        out['SMA_50'] = ta.sma(close, length=50)
+        out['EMA_20'] = ta.ema(close, length=20)
+    except Exception:
+        out['SMA_20'] = out['SMA_50'] = out['EMA_20'] = pd.NA
+
     # RSI
-    out['RSI'] = ta.rsi(close, length=14)
-    # MACD
-    macd = ta.macd(close, fast=12, slow=26, signal=9)
-    if isinstance(macd, pd.DataFrame):
-        out['MACD'] = macd['MACD_12_26_9']
-        out['MACD_SIGNAL'] = macd['MACDs_12_26_9']
-    # Bollinger Bands
-    bbands = ta.bbands(close, length=20, std=2)
-    if isinstance(bbands, pd.DataFrame):
-        out['BBL'] = bbands['BBL_20_2.0']
-        out['BBM'] = bbands['BBM_20_2.0']
-        out['BBU'] = bbands['BBU_20_2.0']
+    try:
+        out['RSI'] = ta.rsi(close, length=14)
+    except Exception:
+        out['RSI'] = pd.NA
+
+    # MACD - dynamic column detection
+    try:
+        macd = ta.macd(close, fast=12, slow=26, signal=9)
+        if isinstance(macd, pd.DataFrame):
+            macd_cols = list(macd.columns)
+            # main MACD line (contains 'MACD' and a number signature)
+            macd_main_candidates = [c for c in macd_cols if 'MACD' in c and ('h' not in c.lower() and 'hist' not in c.lower())]
+            macd_signal_candidates = [c for c in macd_cols if 'MACDs' in c or 'signal' in c.lower()]
+            if macd_main_candidates:
+                out['MACD'] = macd[macd_main_candidates[0]]
+            else:
+                out['MACD'] = pd.NA
+            if macd_signal_candidates:
+                out['MACD_SIGNAL'] = macd[macd_signal_candidates[0]]
+            else:
+                out['MACD_SIGNAL'] = pd.NA
+        else:
+            out['MACD'] = out['MACD_SIGNAL'] = pd.NA
+    except Exception:
+        out['MACD'] = out['MACD_SIGNAL'] = pd.NA
+
+    # Bollinger Bands - dynamic detection for versions that use different suffix formats
+    try:
+        bbands = ta.bbands(close, length=20, std=2)
+        if isinstance(bbands, pd.DataFrame):
+            bcols = list(bbands.columns)
+            bbl = next((c for c in bcols if c.startswith('BBL_') or c.startswith('bb_lower') or c.lower().startswith('lowerband')), None)
+            bbm = next((c for c in bcols if c.startswith('BBM_') or c.startswith('bb_middle') or c.lower().startswith('middleband')), None)
+            bbu = next((c for c in bcols if c.startswith('BBU_') or c.startswith('bb_upper') or c.lower().startswith('upperband')), None)
+            out['BBL'] = bbands[bbl] if bbl in bcols else pd.NA
+            out['BBM'] = bbands[bbm] if bbm in bcols else pd.NA
+            out['BBU'] = bbands[bbu] if bbu in bcols else pd.NA
+        else:
+            out['BBL'] = out['BBM'] = out['BBU'] = pd.NA
+    except Exception:
+        out['BBL'] = out['BBM'] = out['BBU'] = pd.NA
+
     return out
 
 # ---------------------------
-# Sequences and forecasting helpers
+# Sequence helpers & forecasting
 # ---------------------------
 def create_sequences(scaled_data: np.ndarray, base_days: int):
     X = []
@@ -117,6 +160,7 @@ def create_sequences(scaled_data: np.ndarray, base_days: int):
         X.append(scaled_data[i-base_days:i])
     X = np.array(X).reshape((-1, base_days, 1))
     return X
+
 
 def iterative_forecast(model, scaler: MinMaxScaler, last_seq: np.ndarray, days: int, base_days: int):
     seq = last_seq.copy()
@@ -131,15 +175,16 @@ def iterative_forecast(model, scaler: MinMaxScaler, last_seq: np.ndarray, days: 
     return preds_inv.flatten()
 
 # ---------------------------
-# Price alerts (Telegram & Email)
+# Alerts (telegram / email)
 # ---------------------------
 def send_telegram_message(bot_token: str, chat_id: str, text: str):
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        resp = requests.post(url, json={"chat_id": chat_id, "text": text})
+        resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
         return resp.ok
     except Exception:
         return False
+
 
 def send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_pass, to_email, subject, body):
     import smtplib
@@ -161,57 +206,9 @@ def send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_pass, to_email, subjec
         return False
 
 # ---------------------------
-# Auto-retraining worker
-# ---------------------------
-def retrain_model_worker(retrain_interval_hours: float, train_params: dict, stop_event: threading.Event):
-    """
-    Background thread that retrains model every retrain_interval_hours.
-    Uses the same training function as manual train button.
-    """
-    global LAST_RETRAIN_TS, model
-    while not stop_event.is_set():
-        try:
-            # If never retrained before, do first retrain immediately
-            now = datetime.utcnow()
-            if LAST_RETRAIN_TS is None or (now - LAST_RETRAIN_TS).total_seconds() > retrain_interval_hours * 3600:
-                # call training function (which will save to MODEL_PATH)
-                # We call the training function defined below (train_and_save_model)
-                print("Starting scheduled retraining at", now.isoformat())
-                success = train_and_save_model(**train_params)
-                if success:
-                    LAST_RETRAIN_TS = datetime.utcnow()
-                    # reload model (legacy loader)
-                    try:
-                        global MODEL_PATH
-                        if KERAS_LEGACY:
-                            model = legacy_serialization.load_model_keras_2(MODEL_PATH)
-                        else:
-                            # fallback - try tensorflow loader
-                            from tensorflow.keras.models import load_model
-                            model = load_model(MODEL_PATH)
-                    except Exception as e:
-                        print("Failed to reload model after retrain:", e)
-                else:
-                    print("Retrain reported failure.")
-            # Sleep a short while before checking again
-            for _ in range(int(60 * 5)):  # check approximately every 5 minutes for stop flag
-                if stop_event.is_set():
-                    break
-                time.sleep(1)
-        except Exception as e:
-            print("Retrain worker error:", e)
-            time.sleep(60)
-
-# ---------------------------
-# Train function (used by manual and scheduled retrain)
-# Produces a Keras-3 compatible .keras model
+# Training (LSTM) helper
 # ---------------------------
 def train_and_save_model(ticker="BTC-USD", period="3y", base_days=100, epochs=10, batch_size=32, save_path=MODEL_PATH):
-    """
-    Trains a simple LSTM on historical Close prices fetched from yfinance.
-    Saves a Keras-3 .keras model to save_path.
-    Returns True on success, False otherwise.
-    """
     try:
         df = fetch_yf(ticker, period=period, interval="1d")
         series = df[['Close']].dropna()
@@ -227,7 +224,7 @@ def train_and_save_model(ticker="BTC-USD", period="3y", base_days=100, epochs=10
         X = np.array(X).reshape(-1, base_days, 1)
         y = np.array(y).reshape(-1, 1)
 
-        # Build model (Keras)
+        # Build model (TensorFlow Keras)
         from tensorflow.keras.models import Sequential
         from tensorflow.keras.layers import LSTM, Dense, Dropout
         from tensorflow.keras.optimizers import Adam
@@ -242,7 +239,7 @@ def train_and_save_model(ticker="BTC-USD", period="3y", base_days=100, epochs=10
         model_local.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
         model_local.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
 
-        # Save model in Keras 3 format
+        # Save model
         model_local.save(save_path)
         return True
     except Exception as e:
@@ -250,42 +247,40 @@ def train_and_save_model(ticker="BTC-USD", period="3y", base_days=100, epochs=10
         return False
 
 # ---------------------------
-# Async Binance listener (runs in background thread)
-# If python-binance is available, use async approach (best).
-# Otherwise fallback to yfinance polling.
+# Async Binance listener (optional)
 # ---------------------------
 ASYNC_THREAD = None
 ASYNC_STOP = threading.Event()
 
-def run_async_binance(symbols):
-    """
-    Start asyncio loop in a thread, run the binance websockets with AsyncClient.
-    """
-    global ASYNC_LOOP, ASYNC_TASK, ASYNC_RUNNING
+def _normalize_symbol_to_binance(ticker: str):
+    """Convert e.g. BTC-USD or BTC to BTCUSDT safely"""
+    t = ticker.upper().replace('-USD','').replace('USD-','').replace('-','')
+    if t.endswith('USDT'):
+        return t
+    return t + 'USDT'
 
+
+def run_async_binance(symbols):
+    global ASYNC_LOOP, ASYNC_TASK, ASYNC_RUNNING
     if not BINANCE_AVAILABLE:
         print("python-binance not installed; cannot start async Binance WS.")
         return
 
     def _start_loop(loop):
+        import asyncio
         asyncio.set_event_loop(loop)
         loop.run_forever()
 
     async def _listen_symbols(symbols):
-        """
-        Creates a trade socket for each symbol and listens indefinitely.
-        Each message will update LIVE_PRICES dict with the latest trade price.
-        """
         try:
             client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
             sockets = [bm.trade_socket(sym.lower()) for sym in symbols]
-            # Listen to all sockets concurrently
+
             async def _listen_one(sym, sock):
                 async with sock as s:
                     async for msg in s:
                         try:
-                            # msg structure: {'e': 'trade', 'E':..., 's':'BTCUSDT', 'p':'price', ...}
                             if 'p' in msg and 's' in msg:
                                 price = float(msg['p'])
                                 sym_up = msg['s']
@@ -304,13 +299,13 @@ def run_async_binance(symbols):
             except Exception:
                 pass
 
-    # create and start loop in background thread
+    import asyncio
     ASYNC_LOOP = asyncio.new_event_loop()
     t = threading.Thread(target=_start_loop, args=(ASYNC_LOOP,), daemon=True)
     t.start()
-    # schedule the coroutine
     ASYNC_TASK = asyncio.run_coroutine_threadsafe(_listen_symbols(symbols), ASYNC_LOOP)
     ASYNC_RUNNING = True
+
 
 def stop_async_binance():
     global ASYNC_TASK, ASYNC_LOOP, ASYNC_RUNNING
@@ -324,14 +319,13 @@ def stop_async_binance():
         print("Error stopping async binance:", e)
 
 # ---------------------------
-# UI Layout
+# Streamlit UI
 # ---------------------------
 st.title("Crypto Live + Technical Dashboard + Forecasts")
 
 # Top-row controls
 col1, col2, col3 = st.columns([2,2,2])
 with col1:
-    # choose coins for comparison
     selection = st.multiselect("Choose coins", ["BTC-USD","ETH-USD","SOL-USD","BNB-USD"], default=["BTC-USD","ETH-USD"])
 with col2:
     live_interval = st.selectbox("Live chart period", ["1d","5d","1mo","3mo","6mo","1y"], index=0)
@@ -391,9 +385,9 @@ if st.sidebar.button("Manual retrain now"):
 # Start/stop async binance
 if start_binance:
     if BINANCE_AVAILABLE:
-        symbols = [s.replace("-USD","").lower()+"usdt" for s in selection]
+        symbols = [_normalize_symbol_to_binance(s) for s in selection]
         try:
-            run_async_binance([s.replace("-usd","").replace("-USD","").replace("USDT","usdt").replace("usd","").replace("-","") + "usdt" for s in selection])
+            run_async_binance(symbols)
             st.sidebar.success("Started async Binance listener.")
         except Exception as e:
             st.sidebar.error(f"Start failed: {e}")
@@ -411,13 +405,11 @@ if start_poll:
 st.header("Live Prices")
 cols = st.columns(len(selection) if selection else 1)
 for i, ticker in enumerate(selection):
-    # Map ticker e.g. BTC-USD -> BTCUSDT for binance key
-    bin_sym = ticker.replace("-USD","").upper() + "USDT"
+    bin_sym = _normalize_symbol_to_binance(ticker)
     price = None
     with LIVE_LOCK:
         price = LIVE_PRICES.get(bin_sym)
     if price is None:
-        # fallback fetch last close via yfinance
         try:
             df = fetch_yf(ticker, period="5d", interval="1d")
             price = float(df['Close'].iloc[-1])
@@ -433,24 +425,27 @@ for i, ticker in enumerate(selection):
 main_coin = selection[0] if selection else "BTC-USD"
 st.header(f"Technical Dashboard — {main_coin}")
 hist_df = fetch_yf(main_coin, period="1y", interval="1d")
-hist_df['Date'] = pd.to_datetime(hist_df['Date'])
+if 'Date' in hist_df.columns:
+    hist_df['Date'] = pd.to_datetime(hist_df['Date'])
 ind_df = add_technical_indicators(hist_df)
 
 # Show last 10 rows
 st.subheader("Recent data + indicators")
 st.dataframe(ind_df.tail(10))
 
-# Plot Close + MA/EMA + Bollinger
-fig_df = ind_df.set_index('Date')[['Close','SMA_20','SMA_50','EMA_20','BBL','BBM','BBU']].dropna(how='all')
-st.line_chart(fig_df)
+# Plot Close + MA/EMA + Bollinger (only columns that exist)
+plot_cols = [c for c in ['Close','SMA_20','SMA_50','EMA_20','BBL','BBM','BBU'] if c in ind_df.columns]
+fig_df = ind_df.set_index('Date')[plot_cols].dropna(how='all')
+if not fig_df.empty:
+    st.line_chart(fig_df)
 
 # RSI
-if 'RSI' in ind_df.columns:
+if 'RSI' in ind_df.columns and ind_df['RSI'].notna().any():
     st.subheader("RSI (14)")
     st.line_chart(ind_df.set_index('Date')['RSI'].dropna())
 
 # MACD
-if 'MACD' in ind_df.columns:
+if 'MACD' in ind_df.columns and 'MACD_SIGNAL' in ind_df.columns and ind_df[['MACD','MACD_SIGNAL']].notna().any().any():
     st.subheader("MACD")
     st.line_chart(ind_df.set_index('Date')[['MACD','MACD_SIGNAL']].dropna())
 
@@ -459,7 +454,8 @@ if 'MACD' in ind_df.columns:
 # ---------------------------
 st.header("Forecasts (Model-based)")
 full = fetch_yf(main_coin, period="5y", interval="1d")
-full['Date'] = pd.to_datetime(full['Date'])
+if 'Date' in full.columns:
+    full['Date'] = pd.to_datetime(full['Date'])
 st.subheader("Recent historical")
 st.write(full.tail(8))
 
@@ -469,12 +465,12 @@ else:
     series = full[['Close']].dropna()
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(series.values)
-    base_days = 100 if 'base_days' not in locals() else base_days
+    base_days = 100
     if len(scaled) < base_days + 1:
         st.error("Not enough data for forecasting (increase historical period).")
     else:
         last_seq = scaled[-base_days:].reshape(-1)
-        horizons = [7,30,90]  # could be UI-controlled
+        horizons = [7,30,90]
         all_dfs = {}
         for h in horizons:
             preds = iterative_forecast(model, scaler, last_seq, h, base_days)
@@ -499,18 +495,15 @@ else:
                            file_name=f"forecasts_{main_coin}.csv", mime="text/csv")
 
 # ---------------------------
-# Price alert evaluation (simple)
+# Alerts & Notifications (UI)
 # ---------------------------
 st.header("Alerts & Notifications")
 
-# Evaluate alert rule (simple implementation)
 def check_rule_and_notify(ticker, op, val):
-    # get price (prefer live)
-    bin_sym = ticker.replace("-USD","").upper() + "USDT"
+    bin_sym = _normalize_symbol_to_binance(ticker)
     with LIVE_LOCK:
         price = LIVE_PRICES.get(bin_sym)
     if price is None:
-        # fallback to yfinance latest close
         try:
             df = fetch_yf(ticker, period="5d", interval="1d")
             price = float(df['Close'].iloc[-1])
@@ -527,8 +520,7 @@ def check_rule_and_notify(ticker, op, val):
         if price < val:
             triggered = True
             msg = f"{ticker} is below {val}: {price}"
-    elif op == "percent_change_up" or op == "percent_change_down":
-        # compute percent change vs yesterday close
+    elif op in ("percent_change_up", "percent_change_down"):
         try:
             df = fetch_yf(ticker, period="2d", interval="1d")
             prev = float(df['Close'].iloc[-2])
@@ -541,17 +533,14 @@ def check_rule_and_notify(ticker, op, val):
                 msg = f"{ticker} dropped {pct:.2f}% <= -{val}% (price {price})"
         except Exception:
             pass
-    # if triggered, notify
+
     if triggered:
-        # Telegram
         if telegram_token and telegram_chat:
             send_telegram_message(telegram_token, telegram_chat, msg)
-        # Email
         if smtp_host and smtp_user and smtp_pass and email_to:
             send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_pass, email_to, f"Alert: {ticker}", msg)
     return triggered, msg
 
-# Run check once and show UI
 if st.button("Check alert now"):
     res, m = check_rule_and_notify(alert_ticker, alert_operator, alert_value)
     if res:
@@ -560,33 +549,15 @@ if st.button("Check alert now"):
         st.info(f"No alert (status: {m})")
 
 # ---------------------------
-# Generate Google Colab Notebook for training (downloadable .ipynb)
+# Colab notebook generation
 # ---------------------------
 st.header("Generate Google Colab LSTM training notebook")
 if st.button("Generate & Download Colab notebook"):
-    # Build a minimal notebook JSON with cells
     notebook = {
       "cells": [
-        {
-          "cell_type": "markdown",
-          "metadata": {},
-          "source": [
-            "# LSTM training notebook\n",
-            "This notebook trains a simple LSTM on historical Close prices (yfinance) and saves a `.keras` model compatible with Keras 3."
-          ]
-        },
-        {
-          "cell_type": "code",
-          "metadata": {},
-          "source": [
-            "!pip install -q yfinance pandas numpy scikit-learn tensorflow keras\n"
-          ],
-          "outputs": []
-        },
-        {
-          "cell_type": "code",
-          "metadata": {},
-          "source": [
+        {"cell_type": "markdown", "metadata": {}, "source": ["# LSTM training notebook\n", "This notebook trains a simple LSTM on historical Close prices (yfinance) and saves a `.keras` model compatible with Keras 3."]},
+        {"cell_type": "code", "metadata": {}, "source": ["!pip install -q yfinance pandas numpy scikit-learn tensorflow keras\n"], "outputs": []},
+        {"cell_type": "code", "metadata": {}, "source": [
             "import yfinance as yf\n",
             "import numpy as np\n",
             "import pandas as pd\n",
@@ -595,21 +566,18 @@ if st.button("Generate & Download Colab notebook"):
             "from tensorflow.keras.layers import LSTM, Dense, Dropout\n",
             "from tensorflow.keras.optimizers import Adam\n",
             "\n",
-            "# Parameters\n",
             "TICKER = 'BTC-USD'\n",
             "PERIOD = '3y'\n",
             "BASE_DAYS = 100\n",
             "EPOCHS = 10\n",
             "BATCH = 32\n",
             "\n",
-            "# Fetch data\n",
             "df = yf.download(TICKER, period=PERIOD, interval='1d')\n",
             "df = df.reset_index()\n",
             "series = df[['Close']].dropna()\n",
             "scaler = MinMaxScaler()\n",
             "scaled = scaler.fit_transform(series.values)\n",
             "\n",
-            "# Create sequences\n",
             "X = []\n",
             "y = []\n",
             "for i in range(BASE_DAYS, len(scaled)):\n",
@@ -618,7 +586,6 @@ if st.button("Generate & Download Colab notebook"):
             "X = np.array(X).reshape(-1, BASE_DAYS, 1)\n",
             "y = np.array(y).reshape(-1,1)\n",
             "\n",
-            "# Build model\n",
             "model = Sequential()\n",
             "model.add(LSTM(64, return_sequences=True, input_shape=(BASE_DAYS,1)))\n",
             "model.add(Dropout(0.2))\n",
@@ -629,23 +596,11 @@ if st.button("Generate & Download Colab notebook"):
             "model.compile(optimizer=Adam(0.001), loss='mse')\n",
             "model.fit(X, y, epochs=EPOCHS, batch_size=BATCH)\n",
             "\n",
-            "# Save model\n",
             "model.save('trained_model.keras')\n",
             "print('Saved trained_model.keras')\n"
-          ],
-          "outputs": []
-        }
+        ], "outputs": []}
       ],
-      "metadata": {
-        "kernelspec": {
-          "display_name": "Python 3",
-          "language": "python",
-          "name": "python3"
-        },
-        "language_info": {
-          "name": "python"
-        }
-      },
+      "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}, "language_info": {"name": "python"}},
       "nbformat": 4,
       "nbformat_minor": 5
     }
@@ -654,10 +609,9 @@ if st.button("Generate & Download Colab notebook"):
     st.download_button("Download Colab notebook (.ipynb)", data=b, file_name="lstm_train_colab.ipynb", mime="application/json")
 
 # ---------------------------
-# Start retrain scheduler if enabled
+# Auto-retrain scheduler
 # ---------------------------
 if retrain_enable:
-    # We spawn a worker thread if not already running
     if 'retrain_thread' not in st.session_state:
         st.session_state['retrain_stop'] = threading.Event()
         params = {"ticker": alert_ticker, "period": retrain_period, "base_days": 100, "epochs": int(retrain_epochs), "batch_size": int(retrain_batch), "save_path": MODEL_PATH}
@@ -675,7 +629,7 @@ else:
         st.session_state.pop('retrain_stop', None)
 
 # ---------------------------
-# Auto-refresh main UI to show live prices
+# UI auto-refresh
 # ---------------------------
 if st.sidebar.checkbox("Auto refresh main UI (small interval)", value=True):
     interval = st.sidebar.number_input("UI refresh interval seconds", value=2, min_value=1, max_value=60)

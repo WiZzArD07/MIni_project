@@ -11,5 +11,4 @@ requests>=2.31.0
 matplotlib>=3.6.0
 plotly>=5.15.0
 tensorflow-cpu>=2.14.0
-
 python-dateutil

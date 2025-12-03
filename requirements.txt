@@ -9,4 +9,6 @@ plotly
 prophet
 pandas_ta
 python-dateutil
-tensorflow
+keras==3.0.5
+tensorflow-cpu
+

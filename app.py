@@ -637,4 +637,5 @@ if st.sidebar.checkbox("Auto refresh main UI (small interval)", value=True):
         st.session_state['last_rerun'] = time.time()
     if time.time() - st.session_state['last_rerun'] > interval:
         st.session_state['last_rerun'] = time.time()
-        st.experimental_rerun()
+        st.rerun()
+

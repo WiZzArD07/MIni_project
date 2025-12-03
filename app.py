@@ -16,7 +16,7 @@ st.set_page_config(page_title="Crypto Live + Forecast", layout="wide", initial_s
 # -------------------------
 # Load model (trained on BTC)
 # -------------------------
-MODEL_PATH = "Bitcoin_Price_prediction_Model.keras"
+MODEL_PATH = "Bitcoin_Price_prediction_Model (1).keras"
 model = load_model(MODEL_PATH)
 
 # -------------------------

@@ -9,3 +9,4 @@ plotly
 prophet
 pandas_ta
 python-dateutil
+tensorflow

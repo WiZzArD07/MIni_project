@@ -12,6 +12,7 @@ matplotlib>=3.6.0
 plotly>=5.15.0
 tensorflow-cpu>=2.14.0
 python-dateutil
-keras==3.0.5
-tensorflow==2.15.0
+tensorflow==2.16.1
+keras==3.2.0
+
 
